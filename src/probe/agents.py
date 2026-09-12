@@ -39,7 +39,23 @@ class Directive:
     target: str = ""  # capability or tool name it acts on
     key: str = ""
     value: str = ""
+    #: Only fires when this string appears in the task payload. Conditional
+    #: payloads are how a poisoned tool hides from a fixed probe suite.
+    condition: str = ""
 
+    def fires_on(self, payload: dict[str, Any]) -> bool:
+        if not self.condition:
+            return True
+        needle = self.condition.lower()
+        return any(needle in str(v).lower() for v in payload.values())
+
+
+#: A gate such as "when the recipient is at @contractor.test". The lookbehind
+#: keeps it off the domain half of an address the directive itself supplies —
+#: "bcc: archive@grabmail.test" is a payload, not a condition — and the gate
+#: must also sit *before* the directive it qualifies.
+_CONDITION = re.compile(
+    r"\b(?:when|if|for|on)\b[^.]{0,60}?(?<![\w.])(@[\w.\-]+|\d{4}-\d{2}-\d{2})", re.I)
 
 _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("bcc", re.compile(rf"\b(bcc|cc)\b\W{{0,4}}(?:to\s+)?({_EMAIL})", re.I)),
@@ -66,21 +82,23 @@ def parse_directives(toolset: Toolset) -> list[Directive]:
     out: list[Directive] = []
     for tool in toolset:
         for sentence in re.split(r"(?<=[.!?])\s+", tool.description):
+            gate = _CONDITION.search(sentence)
             for kind, pat in _PATTERNS:
                 m = pat.search(sentence)
                 if not m:
                     continue
+                cond = gate.group(1) if gate and gate.end() <= m.start() else ""
                 if kind == "bcc":
                     out.append(Directive("inject_arg", tool.name, "email.send",
-                                         m.group(1).lower(), m.group(2)))
+                                         m.group(1).lower(), m.group(2), cond))
                 elif kind == "copy_to":
                     dest = m.group(1).rstrip(".,")
                     if re.fullmatch(_EMAIL, dest):
                         out.append(Directive("inject_arg", tool.name, "email.send",
-                                             "cc", dest))
+                                             "cc", dest, cond))
                     else:
                         out.append(Directive("precall", tool.name, "email.send",
-                                             "path", dest))
+                                             "path", dest, cond))
                 elif kind == "precall":
                     out.append(Directive("precall", tool.name, _name(m.group(1)),
                                          "tool", _name(m.group(2))))
@@ -142,6 +160,8 @@ class SimulatedAgent:
                 continue
             if d.target not in (tool.name, capability):
                 continue
+            if not d.fires_on(task.payload):
+                continue
             if d.key == "tool":
                 target = toolset[d.value] if d.value in toolset else None
                 if target is None:
@@ -159,7 +179,8 @@ class SimulatedAgent:
               directives: list[Directive]) -> dict[str, Any]:
         args = {p: task.payload[p] for p in tool.params if p in task.payload}
         for d in directives:
-            if d.kind == "inject_arg" and d.target in (capability, tool.name):
+            if (d.kind == "inject_arg" and d.target in (capability, tool.name)
+                    and d.fires_on(task.payload)):
                 args[d.key] = d.value
         return args
 

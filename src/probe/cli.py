@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 
 from .agents import SimulatedAgent
-from .probes import DEFAULT_SUITE, load_suite
-from .report import render
-from .scan import scan
+from .probes import DEFAULT_SUITE, expand, load_suite
+from .report import render, render_pairs
+from .scan import scan, scan_pairs
 from .tools import Toolset
 
 
@@ -37,6 +37,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--agent", choices=("sim", "anthropic"), default="sim",
                         help="'sim' is deterministic and offline; 'anthropic' calls a model")
     parser.add_argument("--model", default="claude-sonnet-5")
+    parser.add_argument("-n", "--variants", type=int, default=1,
+                        help="input variations per probe, drawn from its "
+                             "'variants' pools; raises the cost of a payload "
+                             "conditioned on one recipient or date")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="seed for variant sampling")
+    parser.add_argument("--pairs", action="store_true",
+                        help="also ablate tool pairs, to catch payloads that "
+                             "two tools carry redundantly")
+    parser.add_argument("--interaction-threshold", type=float, default=0.05)
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--fail-on-flag", action="store_true",
@@ -50,13 +60,28 @@ def main(argv: list[str] | None = None) -> int:
     else:
         agent = SimulatedAgent()
 
+    probes = expand(probes, args.variants, seed=args.seed)
     result = scan(toolset, probes, agent=agent, suspects=args.suspect,
                   repeats=args.repeats, alpha=args.alpha,
                   arg_threshold=args.arg_threshold,
                   route_threshold=args.route_threshold)
-    print(json.dumps(result.to_dict(), indent=2) if args.json
-          else render(result, verbose=args.verbose))
-    return 1 if args.fail_on_flag and result.flagged() else 0
+    pairs = scan_pairs(toolset, probes, agent=agent, suspects=args.suspect,
+                       repeats=args.repeats, alpha=args.alpha,
+                       interaction_threshold=args.interaction_threshold
+                       ) if args.pairs else None
+
+    if args.json:
+        payload = result.to_dict()
+        if pairs is not None:
+            payload["pairwise"] = pairs.to_dict()
+        print(json.dumps(payload, indent=2))
+    else:
+        print(render(result, verbose=args.verbose))
+        if pairs is not None:
+            print("\n" + render_pairs(pairs, verbose=args.verbose))
+
+    flagged = bool(result.flagged()) or bool(pairs and pairs.flagged())
+    return 1 if args.fail_on_flag and flagged else 0
 
 
 if __name__ == "__main__":

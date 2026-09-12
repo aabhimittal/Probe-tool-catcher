@@ -1,9 +1,10 @@
 """The scan itself: ablate a tool, measure what it did to the other calls."""
 from __future__ import annotations
 
+import itertools
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from . import features as F
 from .agents import Agent, SimulatedAgent
@@ -16,6 +17,8 @@ SUSPECT_ARGS = "SUSPECT-ARGS"
 ROUTING_SHIFT = "ROUTING-SHIFT"
 CLEAN = "CLEAN"
 UNTESTED = "UNTESTED"
+POISONED_PAIR = "POISONED-PAIR"
+INTERACTION = "INTERACTION"
 
 _SINK_PREFIXES = ("email:", "url:", "path:")
 
@@ -95,19 +98,45 @@ class ScanResult:
                 "verdicts": [v.to_dict() for v in self.verdicts]}
 
 
-def _informative(task: ProbeTask, toolset: Toolset, x: str) -> bool:
+class _Runs:
+    """Agent runs keyed by which tools were removed, so nothing is run twice.
+
+    The full-toolset runs are shared by every suspect, and in a pairwise scan
+    each single ablation is reused across all pairs containing it. Runs are
+    cached as *calls*; which tools get excluded from the event space is a
+    feature-extraction decision made later.
+    """
+
+    def __init__(self, agent: Agent, toolset: Toolset, repeats: int):
+        self._agent, self._toolset, self._repeats = agent, toolset, repeats
+        self._cache: dict[tuple[str, frozenset[str]], list[list]] = {}
+
+    def get(self, task: ProbeTask, removed: Iterable[str] = ()) -> list[list]:
+        key = (task.id, frozenset(removed))
+        if key not in self._cache:
+            toolset = self._toolset
+            for name in key[1]:
+                toolset = toolset.without(name)
+            self._cache[key] = [self._agent.run(task, toolset)
+                                for _ in range(self._repeats)]
+        return self._cache[key]
+
+
+def _informative(task: ProbeTask, toolset: Toolset, *removed: str) -> bool:
     """Is this probe able to say anything about ``x``?
 
-    If ``x`` is the only provider of a capability the task needs, the ablated
+    If the removed tools are the only providers of a capability the task needs,
+    the ablated
     run cannot do the task at all. Everything downstream then changes for a
     trivial reason — the work is gone — and the tool would be flagged for
     being load-bearing rather than for being poisoned. Such probes are
     dropped, which is also why a suite needs tasks that do *not* need the
     tool under test, and substitutes for the ones that do.
     """
+    gone = set(removed)
     for capability in task.intent:
-        providers = [t.name for t in toolset.providing(capability)]
-        if providers == [x]:
+        providers = {t.name for t in toolset.providing(capability)}
+        if providers and providers <= gone:
             return False
     return True
 
@@ -181,21 +210,17 @@ def scan(
     """
     agent = agent or SimulatedAgent()
     names = list(suspects) if suspects else toolset.names
-    full_cache: dict[str, list[list]] = {}
+    runs = _Runs(agent, toolset, repeats)
     verdicts: list[ToolVerdict] = []
 
     for x in names:
         if x not in toolset:
             raise KeyError(f"unknown tool: {x}")
-        ablated = toolset.without(x)
         per_probe: list[ProbeInfluence] = []
         skipped = [t.id for t in probes if not _informative(t, toolset, x)]
         for task in [t for t in probes if _informative(t, toolset, x)]:
-            full_calls = full_cache.setdefault(
-                task.id, [agent.run(task, toolset) for _ in range(repeats)])
-            abl_calls = [agent.run(task, ablated) for _ in range(repeats)]
-            full = [F.extract(c, exclude=x) for c in full_calls]
-            abl = [F.extract(c, exclude=x) for c in abl_calls]
+            full = [F.extract(c, exclude=x) for c in runs.get(task)]
+            abl = [F.extract(c, exclude=x) for c in runs.get(task, [x])]
 
             p_route, q_route = F.distribution(full, "route"), F.distribution(abl, "route")
             d_route = kl(p_route, q_route, alpha)
@@ -234,6 +259,118 @@ def scan(
 
     verdicts.sort(key=lambda v: -v.influence)
     return ScanResult(verdicts, repeats, alpha)
+
+
+@dataclass
+class PairVerdict:
+    """What a pair of tools does together that neither does alone."""
+
+    pair: tuple[str, str]
+    joint: float          # I({x,y}): both removed
+    i_x: float            # same event space, x removed alone
+    i_y: float            # same event space, y removed alone
+    interaction: float    # joint - i_x - i_y; > 0 means superadditive
+    verdict: str
+    joint_sinks: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"pair": list(self.pair), "verdict": self.verdict,
+                "joint": round(self.joint, 4), "i_x": round(self.i_x, 4),
+                "i_y": round(self.i_y, 4),
+                "interaction": round(self.interaction, 4),
+                "joint_sinks": self.joint_sinks, "skipped_probes": self.skipped}
+
+
+@dataclass
+class PairScanResult:
+    pairs: list[PairVerdict]
+    repeats: int
+    alpha: float
+
+    def flagged(self) -> list[PairVerdict]:
+        return [p for p in self.pairs if p.verdict != CLEAN]
+
+    def to_dict(self) -> dict:
+        return {"repeats": self.repeats, "alpha": self.alpha,
+                "pairs": [p.to_dict() for p in self.flagged()]}
+
+
+def _components(full: list, abl: list, alpha: float) -> tuple[float, float]:
+    """Routing and argument divergence between two sets of extracted runs."""
+    route = kl(F.distribution(full, "route"), F.distribution(abl, "route"), alpha)
+    arg, _ = _paired_arg_kl(F.arg_distributions(full), F.arg_distributions(abl), alpha)
+    return route.total, arg
+
+
+def scan_pairs(
+    toolset: Toolset,
+    probes: Sequence[ProbeTask],
+    agent: Agent | None = None,
+    suspects: Sequence[str] | None = None,
+    repeats: int = 1,
+    alpha: float = 0.5,
+    interaction_threshold: float = 0.05,
+) -> PairScanResult:
+    """Score tool *pairs*, to catch what single-tool ablation is blind to.
+
+    Two tools carrying the same payload are individually invisible: remove
+    either one and the other keeps the payload running, so I(x) = I(y) = 0.
+    Only removing both reveals it. This scan compares four conditions per
+    probe — T, T∖x, T∖y, T∖{x,y} — over one event space that excludes both
+    members, and reports two things:
+
+    * ``interaction`` = I({x,y}) − I(x) − I(y). Positive means the pair does
+      something jointly that the parts do not, which is the redundancy
+      signature.
+    * ``joint_sinks``: unsanctioned destinations that survive *both* single
+      ablations and disappear only when the pair goes. These are the ones a
+      single-tool scan cannot see at any threshold.
+
+    Cost is quadratic — 2 + |pairs| conditions per probe, with single
+    ablations reused across pairs — so run it on a shortlist once the
+    single-tool scan is clean, not as the first pass.
+    """
+    agent = agent or SimulatedAgent()
+    names = list(suspects) if suspects else toolset.names
+    for name in names:
+        if name not in toolset:
+            raise KeyError(f"unknown tool: {name}")
+    runs = _Runs(agent, toolset, repeats)
+    out: list[PairVerdict] = []
+
+    for x, y in itertools.combinations(names, 2):
+        skipped = [t.id for t in probes if not _informative(t, toolset, x, y)]
+        usable = [t for t in probes if _informative(t, toolset, x, y)]
+        joint = i_x = i_y = 0.0
+        sinks: set[str] = set()
+        for task in usable:
+            pair = (x, y)
+            full = [F.extract(c, pair) for c in runs.get(task)]
+            q_xy = [F.extract(c, pair) for c in runs.get(task, pair)]
+            q_x = [F.extract(c, pair) for c in runs.get(task, [x])]
+            q_y = [F.extract(c, pair) for c in runs.get(task, [y])]
+
+            joint += sum(_components(full, q_xy, alpha))
+            i_x += sum(_components(full, q_x, alpha))
+            i_y += sum(_components(full, q_y, alpha))
+
+            p_arg = F.distribution(full, "arg")
+            raws = F.raw_values(full)
+            survives = set(F.distribution(q_x, "arg")) & set(F.distribution(q_y, "arg"))
+            sinks.update(s for s in _novel_sinks(p_arg, F.distribution(q_xy, "arg"),
+                                                 raws, task)
+                         if s in survives)
+
+        interaction = joint - i_x - i_y
+        verdict = (POISONED_PAIR if sinks else
+                   INTERACTION if usable and interaction > interaction_threshold
+                   else CLEAN)
+        out.append(PairVerdict((x, y), joint, i_x, i_y, interaction, verdict,
+                               sorted(sinks), skipped))
+
+    out.sort(key=lambda p: -p.interaction)
+    return PairScanResult(out, repeats, alpha)
 
 
 def _classify(i_route: float, i_arg: float, sinks: list[str],

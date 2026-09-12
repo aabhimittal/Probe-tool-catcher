@@ -60,11 +60,17 @@ class Feature:
     raw: str = ""
 
 
-def extract(calls: Iterable[ToolCall], exclude: str | None = None) -> list[Feature]:
-    """Features for the calls the agent made to tools *other than* ``exclude``."""
+def extract(calls: Iterable[ToolCall],
+            exclude: str | Iterable[str] | None = None) -> list[Feature]:
+    """Features for the calls the agent made to tools *other than* ``exclude``.
+
+    ``exclude`` takes a set for pairwise scans, where the event space has to
+    drop both members of the pair so all four conditions stay comparable.
+    """
+    dropped = {exclude} if isinstance(exclude, str) else set(exclude or ())
     out: list[Feature] = []
     for call in calls:
-        if exclude is not None and call.tool == exclude:
+        if call.tool in dropped:
             continue
         out.append(Feature(f"tool:{call.tool}", "route", call.tool))
         for key in sorted(call.args):

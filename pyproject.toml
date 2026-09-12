@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probe-tool-catcher"
+version = "0.1.0"
+description = "Catch poisoned tools by their causal effect on calls to other tools."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+
+[project.scripts]
+probe = "probe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

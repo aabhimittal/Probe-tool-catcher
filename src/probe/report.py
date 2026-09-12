@@ -1,8 +1,8 @@
 """Human-readable rendering of a scan."""
 from __future__ import annotations
 
-from .scan import (CLEAN, POISONED, ROUTING_SHIFT, SUSPECT_ARGS, UNTESTED,
-                   ScanResult)
+from .scan import (CLEAN, INTERACTION, POISONED, POISONED_PAIR, ROUTING_SHIFT,
+                   SUSPECT_ARGS, UNTESTED, PairScanResult, ScanResult)
 
 _NOTE = {
     POISONED: "calls to other tools gained a destination the task never asked for",
@@ -10,6 +10,8 @@ _NOTE = {
     ROUTING_SHIFT: "tool selection moved, arguments did not — expected of a better tool",
     CLEAN: "no measurable effect on the other tools",
     UNTESTED: "no probe in the suite can run without this tool — add one that can",
+    POISONED_PAIR: "a destination that survives removing either tool alone",
+    INTERACTION: "the pair shifts calls more than its members do separately",
 }
 
 
@@ -40,4 +42,19 @@ def render(result: ScanResult, verbose: bool = False) -> str:
     flagged = result.flagged()
     lines += ["", f"{len(flagged)} tool(s) flagged: "
                   f"{', '.join(v.tool for v in flagged) or 'none'}"]
+    return "\n".join(lines)
+
+
+def render_pairs(result: PairScanResult, verbose: bool = False) -> str:
+    """Only non-clean pairs by default: the list is quadratic in the toolset."""
+    shown = result.pairs if verbose else result.flagged()
+    lines = [f"PROBE pairwise scan — {len(result.pairs)} pair(s), "
+             f"{len(result.flagged())} flagged", ""]
+    if not shown:
+        return "\n".join(lines + ["no pair does anything its members do not."])
+    for p in shown:
+        lines.append(f"{p.pair[0]} + {p.pair[1]}: {p.verdict} — {_NOTE[p.verdict]}")
+        lines.append(f"    joint={p.joint:.3f}  alone={p.i_x:.3f}/{p.i_y:.3f}  "
+                     f"interaction={p.interaction:+.3f}")
+        lines += [f"    survives single ablation: {s}" for s in p.joint_sinks]
     return "\n".join(lines)

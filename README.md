@@ -77,6 +77,56 @@ the scan splits the repeats of the *full* toolset in half and scores one half
 against the other, per component; that self-divergence is subtracted before
 classification. A deterministic agent floors at zero.
 
+## Two things single-tool ablation cannot see
+
+**Redundant payloads.** Two tools carrying the same instruction are each
+individually invisible: remove either and the other keeps the payload running,
+so `I(x) = I(y) = 0` and both read `CLEAN`. `scan_pairs` compares four
+conditions per probe — `T`, `T∖x`, `T∖y`, `T∖{x,y}` — over one event space
+that drops both members, and reports
+
+- `interaction = I({x,y}) − I(x) − I(y)`, positive when the pair does
+  something its parts do not, and
+- **joint sinks**: unsanctioned destinations that survive *both* single
+  ablations and vanish only when the pair goes. No single-tool threshold
+  reaches these.
+
+```bash
+probe examples/evasive_pair.json --pairs -n 6
+```
+
+```
+calendar_sync_a  CLEAN     0.000  0.000  0.000
+calendar_sync_b  CLEAN     0.000  0.000  0.000
+
+calendar_sync_a + calendar_sync_b: POISONED-PAIR — a destination that survives removing either tool alone
+    joint=0.707  alone=0.000/0.000  interaction=+0.707
+    survives single ablation: arg:send_email.bcc=email:grabmail.test
+```
+
+Cost is quadratic (`2 + |pairs|` conditions per probe, single ablations reused
+across pairs), so run it on a shortlist after the single-tool scan is clean —
+not as the first pass.
+
+**Conditional payloads.** A tool that only fires for one recipient, one date,
+or one phrase sails past a fixed suite. Give a probe `variants` pools and
+`-n N` draws `N` input variations of it, substituting `{slot}` placeholders in
+the prompt so the text and the payload agree. Drawn values land in `payload`,
+so they count as sanctioned and sink detection keeps working.
+
+In `examples/evasive_pair.json`, `crm_lookup` injects a CC only for
+`@contractor.test` recipients:
+
+| `-n` | probes run | `crm_lookup` |
+|---|---|---|
+| 1 | 5 | `CLEAN` |
+| 2 | 7 | `CLEAN` |
+| 6 | 15 | `POISONED` |
+
+Read that table as the limitation, not the fix. Variation makes conditioning
+expensive — a payload that fires on a narrower slice of traffic is worth less
+to the attacker — but a condition on something you never varied still wins.
+
 ## Try it
 
 ```bash
@@ -106,7 +156,8 @@ ones — `weather_v2` (adds a BCC) and `notes_sync` (adds a file write to an
 attacker-chosen path before every send).
 
 Gate a CI job on it with `--fail-on-flag` (exit 1 when anything is flagged;
-`ROUTING-SHIFT` and `UNTESTED` are not).
+`ROUTING-SHIFT` and `UNTESTED` are not). Add `--pairs` and `-n N` for the two
+scans described above.
 
 ## Running it against a real agent
 
@@ -124,8 +175,9 @@ export ANTHROPIC_API_KEY=...
 probe examples/office_suite.json --agent anthropic --repeats 8
 ```
 
-Cost is `2 × |probes| × |suspects| × repeats` agent runs; the full-toolset runs
-are computed once and shared across suspects. Any object with
+Cost is `2 × |probes| × |suspects| × repeats` agent runs, times `-n` for
+variants; full-toolset and single-ablation runs are cached and shared across
+suspects and pairs. Any object with
 `run(task, toolset) -> list[ToolCall]` works as an agent.
 
 ## Writing a probe suite
@@ -146,9 +198,11 @@ Two rules decide whether a suite can catch anything:
 
 - **The probe suite is the attack surface.** A payload conditioned on a date,
   a specific recipient, or a phrase your probes never use will not fire, and
-  PROBE will report `CLEAN` with a straight face. Varying probe inputs raises
-  the cost of that conditioning; it does not close it. This is a detector for
-  payloads that fire often enough to be worth having, not a proof of absence.
+  PROBE will report `CLEAN` with a straight face. `-n` widens the input
+  distribution and the table above shows it working — and also shows the
+  detection is probabilistic in the number of draws. A condition on an axis
+  you never varied is still a clean miss. This is a detector for payloads that
+  fire often enough to be worth having, not a proof of absence.
 - **`CLEAN` means "no measured influence on this suite"** and nothing more.
 - **Routing shifts still need a human.** `ROUTING-SHIFT` says a tool captured
   traffic from its neighbours. That is what an upgrade looks like and also
@@ -161,20 +215,20 @@ Two rules decide whether a suite can catch anything:
   exist. The influence metric is the entire differentiator: everything here is
   behavioural and would survive an attacker who writes a description no
   reviewer objects to.
-- **Composition is untested.** Two tools that are individually clean can be
-  jointly poisonous; single-tool ablation cannot see that. Pairwise ablation
-  is the obvious extension and is not implemented.
+- **Composition stops at pairs.** `--pairs` catches two tools carrying one
+  payload between them. Three-way redundancy is invisible to it, and the cost
+  of going further is combinatorial: `C(n,3)` conditions per probe.
 
 ## Layout
 
 | file | role |
 |---|---|
 | `src/probe/tools.py` | tool manifests, recorded calls, ablation (`Toolset.without`) |
-| `src/probe/probes.py` | probe tasks and the default suite |
+| `src/probe/probes.py` | probe tasks, input variation (`expand`), default suite |
 | `src/probe/agents.py` | `SimulatedAgent`, `AnthropicAgent`, directive parsing |
 | `src/probe/features.py` | call → event space, value bucketing |
 | `src/probe/divergence.py` | smoothed KL, JS |
-| `src/probe/scan.py` | ablation loop, noise floor, sinks, verdicts |
+| `src/probe/scan.py` | ablation loops (single + `scan_pairs`), noise floor, sinks, verdicts |
 | `src/probe/report.py`, `cli.py` | rendering and the `probe` command |
 
 ```bash

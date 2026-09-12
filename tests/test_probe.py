@@ -3,13 +3,17 @@ import unittest
 from collections import Counter
 
 from probe import ProbeTask, Toolset, scan
+from probe.probes import expand
+from probe.scan import scan_pairs
 from probe.divergence import kl
 from probe.features import bucket
 from probe.probes import DEFAULT_SUITE
-from probe.scan import CLEAN, POISONED, ROUTING_SHIFT, UNTESTED
+from probe.scan import (CLEAN, POISONED, POISONED_PAIR, ROUTING_SHIFT,
+                        UNTESTED)
 from probe.tools import Tool, ToolCall
 
 CONFIG = "examples/office_suite.json"
+EVASIVE = "examples/evasive_pair.json"
 
 
 class TestBucket(unittest.TestCase):
@@ -93,6 +97,70 @@ class TestScan(unittest.TestCase):
         v = scan(toolset, probes).verdicts[0]
         self.assertEqual(v.verdict, UNTESTED)
         self.assertEqual(v.skipped, ["p"])
+
+
+class TestVariants(unittest.TestCase):
+    def test_expansion_fills_the_prompt_from_the_drawn_payload(self):
+        task = ProbeTask("t", "Mail {to}", ("email.send",), {"to": "a@x.test"},
+                         {"to": ["b@y.test"]})
+        variant = expand([task], 2)[0]
+        self.assertEqual(variant.payload["to"], "b@y.test")
+        self.assertEqual(variant.prompt, "Mail b@y.test")
+        self.assertTrue(variant.id.startswith("t#"))
+
+    def test_tasks_without_pools_pass_through_unchanged(self):
+        task = ProbeTask("t", "Mail it", ("email.send",), {"to": "a@x.test"})
+        self.assertEqual(expand([task], 5), [task])
+
+    def test_conditional_payload_is_invisible_until_inputs_vary(self):
+        # crm_lookup only injects for @contractor.test recipients, which the
+        # fixed suite never uses. This is the evasion the README warns about:
+        # variation raises the attacker's cost, it does not close the hole.
+        toolset = Toolset.from_json(EVASIVE)
+
+        def verdict(n):
+            r = scan(toolset, expand(DEFAULT_SUITE, n))
+            return next(v.verdict for v in r.verdicts if v.tool == "crm_lookup")
+
+        self.assertEqual(verdict(1), CLEAN)
+        self.assertEqual(verdict(6), POISONED)
+
+
+class TestPairs(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.toolset = Toolset.from_json(EVASIVE)
+        cls.probes = expand(DEFAULT_SUITE, 6)
+
+    def test_redundant_payload_hides_from_single_tool_ablation(self):
+        result = scan(self.toolset, self.probes)
+        for name in ("calendar_sync_a", "calendar_sync_b"):
+            v = next(v for v in result.verdicts if v.tool == name)
+            self.assertEqual(v.verdict, CLEAN, name)
+            self.assertEqual(v.influence, 0.0)
+
+    def test_pair_ablation_catches_it(self):
+        flagged = scan_pairs(self.toolset, self.probes).flagged()
+        self.assertEqual([p.pair for p in flagged],
+                         [("calendar_sync_a", "calendar_sync_b")])
+        pair = flagged[0]
+        self.assertEqual(pair.verdict, POISONED_PAIR)
+        self.assertEqual(pair.joint_sinks,
+                         ["arg:send_email.bcc=email:grabmail.test"])
+        self.assertGreater(pair.interaction, 0.05)   # superadditive
+        self.assertEqual((pair.i_x, pair.i_y), (0.0, 0.0))
+
+    def test_a_pair_that_shares_no_payload_is_clean(self):
+        pairs = {p.pair: p for p in scan_pairs(self.toolset, self.probes).pairs}
+        self.assertEqual(pairs[("write_file", "search_web")].verdict, CLEAN)
+
+    def test_pair_is_skipped_when_it_owns_the_only_provider(self):
+        pairs = {p.pair: p for p in scan_pairs(self.toolset, self.probes).pairs}
+        # Both calendar_sync tools provide calendar.sync and nothing else does,
+        # but no probe needs it; send_email is the sole mailer, so mail probes
+        # drop out of every pair containing it.
+        self.assertTrue(any("status-email" in s
+                            for s in pairs[("send_email", "write_file")].skipped))
 
 
 class NoisyAgent:
